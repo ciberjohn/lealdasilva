@@ -1,45 +1,102 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Exit immediately if a command exits with a non-zero status
-set -e
+# Exit on error, undefined variables, and pipe failures
+set -euo pipefail
+IFS=$'\n\t'
 
-# Update package list and install prerequisites
-sudo apt-get update
-sudo apt-get install -y \
+# Function to display progress
+show_progress() {
+    echo "===> $1"
+}
+
+# Function to check if command exists
+command_exists() {
+    command -v "$1" &> /dev/null
+}
+
+# Check for root privileges
+if [ "$EUID" -ne 0 ]; then
+    show_progress "Requesting sudo privileges"
+    SUDO="sudo"
+else
+    SUDO=""
+fi
+
+# Install prerequisites
+show_progress "Installing prerequisites..."
+$SUDO apt-get update
+$SUDO apt-get install -y \
     apt-transport-https \
     ca-certificates \
     curl \
+    gnupg \
+    lsb-release \
     software-properties-common
 
-# Add Docker's official GPG key
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+# Add Docker's official GPG key using more secure method
+show_progress "Adding Docker's GPG key..."
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
 
-# Add Docker repository manually
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > />
+# Add Docker repository
+show_progress "Adding Docker repository..."
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+    $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-# Update the package list again and install Docker Engine
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+# Install Docker Engine
+show_progress "Installing Docker Engine..."
+$SUDO apt-get update
+$SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
-# Add the current user to the Docker group
-sudo usermod -aG docker $USER
+# Configure Docker to use systemd as cgroup driver
+show_progress "Configuring Docker daemon..."
+$SUDO mkdir -p /etc/docker
+cat <<EOF | $SUDO tee /etc/docker/daemon.json
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
 
+# Create systemd directory for Docker
+$SUDO mkdir -p /etc/systemd/system/docker.service.d
 
-# Enable Docker service to start on boot
-sudo systemctl enable docker
+# Restart Docker
+show_progress "Restarting Docker daemon..."
+$SUDO systemctl daemon-reload
+$SUDO systemctl restart docker
+$SUDO systemctl enable docker
 
-# Install Docker Compose (latest version)
-sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-sudo chmod +x /usr/local/bin/docker-compose
+# Add user to Docker group
+show_progress "Adding current user to Docker group..."
+$SUDO usermod -aG docker "$USER"
+newgrp docker
 
-# Verify Docker Compose installation
-sg docker -c "docker-compose --version"
+# Verify installations
+show_progress "Verifying installations..."
+docker --version
+docker compose version
 
-
-# Reload group membership in a subshell (does not replace the shell)
-sg docker -c "docker run --rm hello-world"
+# Test Docker installation
+show_progress "Testing Docker installation..."
+docker run --rm hello-world
 
 # Cleanup
-sudo apt-get clean
+show_progress "Cleaning up..."
+$SUDO apt-get clean
+$SUDO apt-get autoremove -y
 
-echo "Docker and Docker Compose have been successfully installed and configured."
+echo "
+===========================================
+   Docker Installation Complete!
+   - Docker Engine is installed
+   - Docker Compose plugin is installed
+   - Docker service is enabled
+   - Current user added to docker group
+   
+   Please log out and back in for 
+   group changes to take effect.
+==========================================="
