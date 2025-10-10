@@ -29,6 +29,19 @@ command_exists() {
     command -v "$1" &> /dev/null
 }
 
+# Function to get Ubuntu codename
+get_ubuntu_codename() {
+    # Check if this is Linux Mint
+    if [ -f "/etc/linuxmint/info" ]; then
+        # Extract Ubuntu base from Linux Mint
+        UBUNTU_BASE=$(grep "UBUNTU_CODENAME" /etc/os-release | cut -d= -f2 | tr -d '"')
+        echo "$UBUNTU_BASE"
+    else
+        # For Ubuntu and others, use lsb_release directly
+        lsb_release -cs
+    fi
+}
+
 # Check for root privileges
 if [ "$EUID" -ne 0 ]; then
     show_progress "Requesting sudo privileges"
@@ -47,10 +60,22 @@ remove_podman() {
         $SUDO systemctl disable podman.socket
     fi
 
-    # Remove Podman packages
+    # Remove Podman packages based on distribution
     if command_exists apt; then
-        $SUDO apt remove -y podman podman-docker containers-common containernetworking-plugins
+        # For Ubuntu/Debian/Mint
+        PODMAN_PACKAGES=(
+            "podman"
+            "podman-docker"
+            "containernetworking-plugins"
+        )
+        
+        for package in "${PODMAN_PACKAGES[@]}"; do
+            if $SUDO apt-cache show "$package" > /dev/null 2>&1; then
+                $SUDO apt remove -y "$package"
+            fi
+        done
         $SUDO apt autoremove -y
+        
     elif command_exists dnf; then
         $SUDO dnf remove -y podman podman-docker containers-common containernetworking-plugins
         $SUDO dnf autoremove -y
@@ -59,13 +84,16 @@ remove_podman() {
         $SUDO yum autoremove -y
     fi
 
-    # Remove Podman configuration
-    rm -rf ~/.config/containers
+    # Remove Podman configuration and data
+    rm -rf ~/.config/containers ~/.local/share/containers
+    $SUDO rm -rf /var/lib/containers
 
     # Remove Podman Compose if installed
     if command_exists podman-compose; then
         $SUDO pip3 uninstall -y podman-compose || true
     fi
+
+    show_progress "Podman removal completed"
 }
 
 # Function to install Docker
@@ -77,14 +105,23 @@ install_docker() {
         ca-certificates \
         curl \
         gnupg \
-        lsb-release
+        lsb-release \
+        software-properties-common
 
     show_progress "Adding Docker's GPG key..."
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+    $SUDO install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Get the correct Ubuntu codename
+    UBUNTU_CODENAME=$(get_ubuntu_codename)
+    show_progress "Using Ubuntu codename: $UBUNTU_CODENAME"
 
     show_progress "Adding Docker repository..."
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
-        $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
+    echo \
+    "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+    $UBUNTU_CODENAME stable" | \
+    $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
 
     show_progress "Installing Docker Engine..."
     $SUDO apt-get update
