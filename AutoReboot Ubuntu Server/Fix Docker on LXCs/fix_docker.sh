@@ -1,39 +1,86 @@
 #!/bin/bash
 
-# 1. Fix the Repository Mismatch
-echo "--- Fixing Docker Repository (Jammy -> Noble) ---"
-
-# Find the file defining the docker repo. Usually /etc/apt/sources.list.d/docker.list
-# We use sed to replace 'jammy' with 'noble' inside that file.
-if grep -q "jammy" /etc/apt/sources.list.d/docker.list 2>/dev/null; then
-    sed -i 's/jammy/noble/g' /etc/apt/sources.list.d/docker.list
-    echo "Updated docker.list to use Noble."
-elif grep -q "jammy" /etc/apt/sources.list 2>/dev/null; then
-    sed -i 's/jammy/noble/g' /etc/apt/sources.list
-    echo "Updated sources.list to use Noble."
-else
-    echo "Could not automatically find the file with 'jammy' inside. Continuing anyway to see if apt-get update fixes it..."
+# --- 1. Permission Check ---
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root (sudo ./fix_docker_universal.sh)"
+  exit 1
 fi
 
-# 2. Update the catalog
+# --- 2. Dynamic OS Detection ---
+echo "--- Detecting System Information ---"
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    CURRENT_CODENAME=$VERSION_CODENAME
+else
+    CURRENT_CODENAME=$(lsb_release -cs)
+fi
+
+echo "Detected OS Codename: $CURRENT_CODENAME"
+
+# --- 3. Repository Repair ---
+# We check if the docker list file exists and if it points to the WRONG codename
+DOCKER_LIST="/etc/apt/sources.list.d/docker.list"
+# Sometimes it's named differently, check common default
+if [ ! -f "$DOCKER_LIST" ]; then
+    DOCKER_LIST=$(grep -l "download.docker.com" /etc/apt/sources.list.d/* | head -n 1)
+fi
+
+if [ -f "$DOCKER_LIST" ]; then
+    echo "Checking Docker repository file: $DOCKER_LIST"
+    
+    # If the file DOES NOT contain the current codename, but contains 'jammy' or 'focal' etc
+    if ! grep -q "$CURRENT_CODENAME" "$DOCKER_LIST"; then
+        echo "MISMATCH DETECTED: Repo file does not match OS ($CURRENT_CODENAME)."
+        echo "Backing up and patching repository file..."
+        cp "$DOCKER_LIST" "${DOCKER_LIST}.bak"
+        
+        # Regex to replace whatever old codename (word between stable and arch, or just the codename) 
+        # This sed command blindly swaps any distribution codename for the current one in that file
+        # It looks for the standard docker.list format
+        sed -i "s/ubuntu \([a-z]*\) stable/ubuntu $CURRENT_CODENAME stable/g" "$DOCKER_LIST"
+        
+        echo "Repository patched to point to $CURRENT_CODENAME."
+    else
+        echo "Repository looks correct (matches $CURRENT_CODENAME)."
+    fi
+else
+    echo "WARNING: Could not find a dedicated docker.list file. Skipping repo repair step."
+fi
+
+# --- 4. Update Lists ---
 echo "--- Updating Apt Catalog ---"
-apt-get update
+apt-get update -qq
 
-# 3. Perform the Downgrade
-echo "--- Installing containerd.io 1.7.28 for Noble ---"
+# --- 5. Find Safe Version (1.7.x) ---
+echo "--- Searching for Safe containerd.io (1.7.x) ---"
 
-# Note: The version string for Noble is usually slightly different. 
-# We force this specific version which is known to work with LXC.
-apt-get install -y --allow-downgrades containerd.io=1.7.28-1~ubuntu.24.04~noble
+# We query the policy, filter for 1.7., and grab the first one (highest 1.7 available)
+# This works regardless of whether it's Debian, Ubuntu, Noble, or Jammy.
+TARGET_VERSION=$(apt-cache madison containerd.io | awk '{print $3}' | grep '1.7.' | head -n 1)
+
+if [ -z "$TARGET_VERSION" ]; then
+    echo "ERROR: Could not find any 1.7.x version of containerd.io."
+    echo "If you are using the default Ubuntu packages (docker.io), uninstall them and install official docker-ce."
+    exit 1
+fi
+
+echo "Target Safe Version Identified: $TARGET_VERSION"
+
+# --- 6. Execute Downgrade ---
+echo "--- Installing & Holding Version ---"
+apt-get install -y --allow-downgrades containerd.io="$TARGET_VERSION"
 
 if [ $? -eq 0 ]; then
-    echo "--- Success! ---"
     apt-mark hold containerd.io
-    echo "containerd.io held at 1.7.28."
+    echo "SUCCESS: containerd.io downgraded and held at $TARGET_VERSION"
     
+    echo "--- Restarting Docker ---"
     systemctl restart docker
-    echo "Docker restarted. Try running your containers now."
+    
+    echo "--- Verification ---"
+    docker version | grep "Version"
+    echo "You can now start your containers."
 else
-    echo "--- Failed ---"
-    echo "Could not find the specific package version. Run 'apt-cache policy containerd.io' to see what is available now that the repo is fixed."
+    echo "FAILED: Apt install failed."
+    exit 1
 fi
